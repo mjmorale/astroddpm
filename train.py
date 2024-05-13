@@ -27,9 +27,9 @@ if args.dataset == 'probes':
         './data/probes/',
         logdir = './logs/probes/',
         image_size = 256,
-        train_batch_size = 56,
+        train_batch_size = 2,
         train_lr = 2e-5,
-        train_num_steps = 750001,         # total training steps
+        train_num_steps = 1,         # total training steps
         gradient_accumulate_every = 2,    # gradient accumulation steps
         ema_decay = 0.995,                # exponential moving average decay
         num_workers=32,
@@ -52,5 +52,5 @@ if args.dataset == 'sdss':
     )
 
 if args.milestone != 0:
-    trainer.load(milestone)
+    trainer.load(args.milestone)
 trainer.train()
