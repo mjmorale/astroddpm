@@ -1,5 +1,6 @@
 import math
 import copy
+import os
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
@@ -18,6 +19,7 @@ from tqdm import tqdm
 from einops import rearrange
 
 from time import time
+import imageio.v3 as iio
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -295,6 +297,11 @@ def cosine_beta_schedule(timesteps, s = 0.008):
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
     return np.clip(betas, a_min = 0, a_max = 0.999)
 
+def compute_alpha(beta, t):
+    beta = torch.cat([torch.zeros(1).to(beta.device), beta], dim=0)
+    a = (1 - beta).cumprod(dim=0).index_select(0, t + 1).view(-1, 1, 1, 1)
+    return a
+
 class GaussianDiffusion(nn.Module):
     def __init__(
         self, 
@@ -304,7 +311,10 @@ class GaussianDiffusion(nn.Module):
         channels = 3,
         timesteps = 1000, 
         loss_type = 'l1', 
-        betas = None
+        betas = None,
+        input_directory,
+        etaA,
+        etaB
     ):
         super().__init__()
         self.channels = channels
@@ -316,6 +326,15 @@ class GaussianDiffusion(nn.Module):
         else:
             betas = cosine_beta_schedule(timesteps)
 
+        # def sigmoid(x):
+        #     return 1 / (np.exp(-x) + 1)
+
+        # betas = np.linspace(-6, 6, 1000)
+        # betas = sigmoid(betas) * (0.0001 - 1) + 1
+
+        # betas = np.linspace(
+        #     0.0001, 0.02, 1000, dtype=np.float64
+        # )
         alphas = 1. - betas
         alphas_cumprod = np.cumprod(alphas, axis=0)
         alphas_cumprod_prev = np.append(1., alphas_cumprod[:-1])
@@ -327,6 +346,7 @@ class GaussianDiffusion(nn.Module):
         to_torch = partial(torch.tensor, dtype=torch.float32)
 
         self.register_buffer('betas', to_torch(betas))
+    #    self.register_buffer('alphas', to_torch(alphas))
         self.register_buffer('alphas_cumprod', to_torch(alphas_cumprod))
         self.register_buffer('alphas_cumprod_prev', to_torch(alphas_cumprod_prev))
 
@@ -347,6 +367,36 @@ class GaussianDiffusion(nn.Module):
             betas * np.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod)))
         self.register_buffer('posterior_mean_coef2', to_torch(
             (1. - alphas_cumprod_prev) * np.sqrt(alphas) / (1. - alphas_cumprod)))
+        self.input_directory = input_directory
+        self.input_files = os.listdir(self.input_directory)
+        print(self.input_files)
+        self.etaA = etaA
+        self.etaB = etaB
+
+
+
+
+    
+    def load_n_images(self, n):
+        imgs = np.empty((n, 3, 256, 256))
+        
+        for i in range(n):
+            if len(self.input_files) == 0:
+                print("No more files to input")
+            path = self.input_directory + '/' + self.input_files[0]
+            self.defaced_images_files = self.input_files[1:]
+            img = iio.imread(path)
+            img = img.transpose((2, 0, 1))
+            img = img / 255.0
+
+            imgs[i] = img
+            # print img min and max
+            print("Image min: ", np.min(img))
+            print("Image max: ", np.max(img))
+            # put to 0 to 1 range
+            print("Image min: ", np.min(img))
+            print("Image max: ", np.max(img))
+        return imgs
 
     def q_mean_variance(self, x_start, t):
         mean = extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
@@ -378,10 +428,187 @@ class GaussianDiffusion(nn.Module):
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start=x_recon, x_t=x, t=t)
         return model_mean, posterior_variance, posterior_log_variance
 
+
+
+
+
+    @torch.no_grad()
+    def p_sample_loop_ddrm(self, x, y_0, seq, H_funcs, etaA, etaC, etaB, sigma_0):
+        device = self.betas.device
+
+        # facilité
+        b = self.betas
+
+
+        singulars = H_funcs.singulars()
+        Sigma = torch.zeros(x.shape[1]*x.shape[2]*x.shape[3], device=x.device)
+        Sigma[:singulars.shape[0]] = singulars
+
+        U_t_y = H_funcs.Ut(y_0)
+        # print min and max of U_t_y
+        print("U_t_y min: ", torch.min(U_t_y))
+        print("U_t_y max: ", torch.max(U_t_y))
+
+
+        Sig_inv_U_t_y = U_t_y / singulars[:U_t_y.shape[-1]]
+        #print min and max of Sig_inv_U_t_y
+        print("Sig_inv_U_t_y min: ", torch.min(Sig_inv_U_t_y))
+        print("Sig_inv_U_t_y max: ", torch.max(Sig_inv_U_t_y))
+
+        largest_alphas = compute_alpha(b, (torch.ones(x.size(0)) * seq[-1]).to(x.device).long())
+        largest_sigmas = (1 - largest_alphas).sqrt() / largest_alphas.sqrt()
+        large_singulars_index = torch.where(singulars * largest_sigmas[0, 0, 0, 0] > sigma_0)
+        inv_singulars_and_zero = torch.zeros(x.shape[1] * x.shape[2] * x.shape[3]).to(singulars.device)
+        inv_singulars_and_zero[large_singulars_index] = sigma_0 / singulars[large_singulars_index]
+        inv_singulars_and_zero = inv_singulars_and_zero.view(1, -1)     
+
+        # implement p(x_T | x_0, y) as given in the paper
+        # if eigenvalue is too small, we just treat it as zero (only for init) 
+        init_y = torch.zeros(x.shape[0], x.shape[1] * x.shape[2] * x.shape[3]).to(x.device)
+        init_y[:, large_singulars_index[0]] = U_t_y[:, large_singulars_index[0]] / singulars[large_singulars_index].view(1, -1)
+        init_y = init_y.view(*x.size())
+        remaining_s = largest_sigmas.view(-1, 1) ** 2 - inv_singulars_and_zero ** 2
+        remaining_s = remaining_s.view(x.shape[0], x.shape[1], x.shape[2], x.shape[3]).clamp_min(0.0).sqrt()
+        init_y = init_y + remaining_s * x
+        init_y = init_y / largest_sigmas
+
+
+
+        #setup iteration variables
+        x = H_funcs.V(init_y.view(x.size(0), -1)).view(*x.size())
+        n = x.size(0)
+        seq_next = [-1] + list(seq[:-1])
+        x0_preds = []
+        xs = [x]
+
+
+
+        
+        #for i in tqdm(reversed(range(0, 100)), desc='sampling loop time step', total=100):
+        for i, j in tqdm(zip(reversed(seq), reversed(seq_next)), total=len(seq), desc='sampling loop time step'):
+            t = (torch.ones(n, dtype=torch.long) * i).to(device)
+            next_t = (torch.ones(n) * j).to(x.device)
+            at = compute_alpha(b, t.long())
+            at_next = compute_alpha(b, next_t.long())
+            xt = xs[-1].to('cuda')
+
+            # the bet
+            et = self.denoise_fn(xt, t)
+
+            x0_t = (xt - et * (1 - at).sqrt()) / at.sqrt()
+
+            #variational inference conditioned on y
+            sigma = (1 - at).sqrt()[0, 0, 0, 0] / at.sqrt()[0, 0, 0, 0]
+            sigma_next = (1 - at_next).sqrt()[0, 0, 0, 0] / at_next.sqrt()[0, 0, 0, 0]
+            xt_mod = xt / at.sqrt()[0, 0, 0, 0]
+            V_t_x = H_funcs.Vt(xt_mod)
+            SVt_x = (V_t_x * Sigma)[:, :U_t_y.shape[1]]
+            V_t_x0 = H_funcs.Vt(x0_t)
+            SVt_x0 = (V_t_x0 * Sigma)[:, :U_t_y.shape[1]]
+
+            falses = torch.zeros(V_t_x0.shape[1] - singulars.shape[0], dtype=torch.bool, device=xt.device)
+            cond_before_lite = singulars * sigma_next > sigma_0
+            cond_after_lite = singulars * sigma_next < sigma_0
+            cond_before = torch.hstack((cond_before_lite, falses))
+            cond_after = torch.hstack((cond_after_lite, falses))
+
+            std_nextC = sigma_next * etaC
+            sigma_tilde_nextC = torch.sqrt(sigma_next ** 2 - std_nextC ** 2)
+
+            std_nextA = sigma_next * etaA
+            sigma_tilde_nextA = torch.sqrt(sigma_next**2 - std_nextA**2)
+            
+            diff_sigma_t_nextB = torch.sqrt(sigma_next ** 2 - sigma_0 ** 2 / singulars[cond_before_lite] ** 2 * (etaB ** 2))
+
+            #missing pixels
+            Vt_xt_mod_next = V_t_x0 + sigma_tilde_nextC * H_funcs.Vt(et) + std_nextC * torch.randn_like(V_t_x0)
+
+            #less noisy than y (after)
+            Vt_xt_mod_next[:, cond_after] = \
+                V_t_x0[:, cond_after] + sigma_tilde_nextA * ((U_t_y - SVt_x0) / sigma_0)[:, cond_after_lite] + std_nextA * torch.randn_like(V_t_x0[:, cond_after])
+            
+            #noisier than y (before)
+            Vt_xt_mod_next[:, cond_before] = \
+                (Sig_inv_U_t_y[:, cond_before_lite] * etaB + (1 - etaB) * V_t_x0[:, cond_before] + diff_sigma_t_nextB * torch.randn_like(U_t_y)[:, cond_before_lite])
+
+            #aggregate all 3 cases and give next prediction
+            xt_mod_next = H_funcs.V(Vt_xt_mod_next)
+            xt_next = (at_next.sqrt()[0, 0, 0, 0] * xt_mod_next).view(*x.shape)
+
+            x0_preds.append(x0_t.to('cpu'))
+            xs.append(xt_next.to('cpu'))
+
+            '''            
+            x_recon = extract(self.sqrt_recip_alphas_cumprod, t, x.shape) * x - \
+            extract(self.sqrt_recipm1_alphas_cumprod, t, x.shape) * self.denoise_fn(x, t)
+
+            # previously conditioned on clip_denoised boolean variable
+            x_recon.clamp_(-1., 1.)
+            model_mean, _, model_log_variance = self.q_posterior(x_start=x_recon, x_t=x, t=t)
+            # previously conditioned on repeat_noise boolean variable
+            noise = noise_like(x.shape, device, False)
+            # mask for t==0
+            nonzero_mask = (1 - (t == 0).float()).reshape(n, *((1,) * (len(x.shape) - 1)))
+            x = model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
+            xs.append(x)
+            '''
+
+
+        return xs  
+        #return xs, x0_preds
+    
+    @torch.no_grad()
+    def sample_ddrm(self, image_size, timesteps, H_funcs, batch_size = 16, sigma_0=0):
+        self.device = self.betas.device
+        image_size = self.image_size
+        channels = self.channels
+        x = torch.randn(
+                batch_size,
+                channels, 
+                image_size,
+                image_size,
+                device=self.device,
+            )
+        x_orig = torch.from_numpy(self.load_n_images(batch_size)).to(self.device).float()
+
+        y_0 = H_funcs.H(x_orig)
+        y_0 = y_0 + sigma_0 * torch.randn_like(y_0)
+        # print min and max of y_0
+        print("y_0 min: ", torch.min(y_0))
+        print("y_0 max: ", torch.max(y_0))
+        
+        skip = 1000//timesteps
+        seq = range(0, 1000, skip)
+
+        
+        retval = self.p_sample_loop_ddrm(x=x, y_0=y_0, seq=seq, H_funcs=H_funcs, etaA=self.etaA,
+                                       etaC=self.etaA, etaB=self.etaB, sigma_0=sigma_0)
+        
+        for i in range(len(x_orig)):
+            orig =  x_orig[-1][i]
+            mse = torch.mean((x[-1][i].to(self.device) - orig) ** 2)
+            psnr = 10 * torch.log10(1 / mse)
+            print(f"PSNR: {psnr}")
+        return retval
+
     @torch.no_grad()
     def p_sample(self, x, t, clip_denoised=True, repeat_noise=False):
         b, *_, device = *x.shape, x.device
-        model_mean, _, model_log_variance = self.p_mean_variance(x=x, t=t, clip_denoised=clip_denoised)
+
+        #1 model_mean, _, model_log_variance = self.p_mean_variance(x=x, t=t, clip_denoised=clip_denoised)
+
+        #2 x_recon = self.predict_start_from_noise(x, t=t, noise=self.denoise_fn(x, t))
+        
+        
+        x_recon = extract(self.sqrt_recip_alphas_cumprod, t, x.shape) * x - \
+            extract(self.sqrt_recipm1_alphas_cumprod, t, x.shape) * self.denoise_fn(x, t)
+        #2
+
+        if clip_denoised:
+            x_recon.clamp_(-1., 1.)
+        
+        model_mean, _, model_log_variance = self.q_posterior(x_start=x_recon, x_t=x, t=t)
+        #1
         noise = noise_like(x.shape, device, repeat_noise)
         # no noise when t == 0
         nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1)))
@@ -394,7 +621,9 @@ class GaussianDiffusion(nn.Module):
         b = shape[0]
         img = torch.randn(shape, device=device)
 
+        #for i in tqdm(reversed(range(0, 100)), desc='sampling loop time step', total=100):
         for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
+
             img = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long))
         return img
 
@@ -487,6 +716,9 @@ class Galaxies(data.Dataset):
         self.folder = folder
         self.image_size = image_size
         self.paths = list(Path(f'{folder}').glob(f'**/*.npy'))
+        f = open('paths.txt', 'w')
+        for path in self.paths[:200]:
+            f.write(f'{path}\n')
         self.min_ = minmaxnorms[0]
         self.max_ = minmaxnorms[1]
 
@@ -554,8 +786,8 @@ class Trainer(object):
         self.logdir = Path(logdir)
         self.logdir.mkdir(exist_ok = True)
 
-        self.ds = Galaxies(folder, image_size, minmaxnorms=(0, 5.5))
-        self.dl = cycle(data.DataLoader(self.ds, batch_size = train_batch_size, shuffle=True, num_workers=num_workers))
+        #self.ds = Galaxies(folder, image_size, minmaxnorms=(0, 5.5))
+        #self.dl = cycle(data.DataLoader(self.ds, batch_size = train_batch_size, shuffle=True, num_workers=num_workers))
         self.opt = Adam(diffusion_model.parameters(), lr=train_lr)
 
         self.step = 0
