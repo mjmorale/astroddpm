@@ -3,6 +3,9 @@ from denoising_diffusion_pytorch import Unet, GaussianDiffusion, Trainer
 import torch
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cpu")
+print(torch.cuda.is_available())
+print(f'Using device: {DEVICE}')
 
 model = Unet(
     dim = 64,
