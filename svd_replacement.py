@@ -1,6 +1,9 @@
 import torch
 import numpy as np
 
+from torch.fft import fft2
+from torch.fft import ifft2
+
 class H_functions:
     """
     A class replacing the SVD of a matrix H, perhaps efficiently.
@@ -49,9 +52,9 @@ class H_functions:
         Multiplies the input vector by H
         """
         temp = self.Vt(vec)
+        print('temp shape ',temp.shape)
         singulars = self.singulars()
-
-
+        print('singulars shape ', singulars.shape)
         return self.U(singulars * temp[:, :singulars.shape[0]])
     
     def Ht(self, vec):
@@ -69,7 +72,177 @@ class H_functions:
         temp = self.Ut(vec)
         singulars = self.singulars()
         temp[:, :singulars.shape[0]] = temp[:, :singulars.shape[0]] / singulars
+        print('temp shape H_pinv ',temp.shape)
         return self.V(self.add_zeros(temp))
+    
+    
+
+
+
+def DFT_matrix_2d(N, device=torch.device('cpu')):
+    theta = (-2 * torch.pi / N)
+    theta = torch.tensor(theta, dtype=torch.float32)
+    w_real = torch.cos(theta)
+    w_imag = torch.sin(theta)
+    w = torch.complex(w_real, w_imag)
+
+    i = torch.arange(N, dtype=torch.float32).view(1, -1).repeat(N, 1)
+    j = torch.arange(N, dtype=torch.float32).view(-1, 1).repeat(1, N)
+
+    i[0, :] = 0
+    j[:, 0] = 0
+
+    retval = torch.empty((N, N), dtype=torch.complex64)
+    retval = w**(i * j) / torch.sqrt(torch.tensor(N, dtype=torch.float32))
+    return retval.to(device)
+
+class Fourier2D_Inpainting(H_functions):
+    
+        def __init__(self, channels, img_dim, device, missing_indices):
+            self.channels = channels
+            self.img_dim = img_dim
+            self._singulars = torch.ones(channels * img_dim**2 - missing_indices.shape[0]).to(device)
+            self.missing_indices = missing_indices
+            self.kept_indices = torch.Tensor([i for i in range(channels * img_dim**2) if i not in missing_indices]).to(device).long()
+            dft_mat = DFT_matrix_2d(img_dim, device)
+    
+            self._Vt = dft_mat
+            self._U = torch.eye(img_dim, device=device).to(torch.complex64)
+            self._V = self._Vt.transpose(0, 1)
+            self._Ut = self._U.transpose(0, 1)
+
+            self.missing_indices = missing_indices
+            self.kept_indices = torch.Tensor([i for i in range(channels * img_dim**2) if i not in missing_indices]).to(device).long()
+            self.missing_indices = missing_indices
+      
+        def V(self, vec):
+            #temp = vec.clone().reshape(vec.shape[0], -1)
+            #out = torch.zeros_like(temp)
+            #out[:, self.kept_indices] = temp[:, :self.kept_indices.shape[0]]
+            #out[:, self.missing_indices] = temp[:, self.kept_indices.shape[0]:]
+            #return out.reshape(vec.shape[0], -1, self.channels).permute(0, 2, 1).reshape(vec.shape[0], -1)
+            
+            temp = vec.clone().reshape(vec.shape[0], -1)
+            
+            #temp = self._V @ temp
+
+            out = torch.zeros_like(temp)
+            out[:, self.kept_indices] = temp[:, :self.kept_indices.shape[0]]
+            out[:, self.missing_indices] = temp[:, self.kept_indices.shape[0]:]
+            out = out.reshape(vec.shape[0], -1, self.channels).permute(0,2,1).reshape(vec.shape[0], self.channels,256,256).to(torch.complex64)
+            out[:, :, :128, :128] = torch.fft.fftshift(out[:, :, :128, :128], dim=(2, 3))
+            out[:, :, 128:, :128] = torch.fft.fftshift(out[:, :, 128:, :128], dim=(2, 3))
+            out[:, :, :128, 128:] = torch.fft.fftshift(out[:, :, :128, 128:], dim=(2, 3))
+            out[:, :, 128:, 128:] = torch.fft.fftshift(out[:, :, 128:, 128:], dim=(2, 3))
+            
+            #out = self._V @ out
+            out = torch.fft.ifft2(out, norm='ortho', dim=(2, 3))
+            
+        
+            
+
+
+            return out.reshape(vec.shape[0], -1).real
+        
+        
+        def Vt(self, vec):
+            #temp = vec.clone().reshape(vec.shape[0], self.channels, -1).permute(0, 2, 1).reshape(vec.shape[0], -1)
+            #out = torch.zeros_like(temp)
+            #out[:, :self.kept_indices.shape[0]] = temp[:, self.kept_indices]
+            #out[:, self.kept_indices.shape[0]:] = temp[:, self.missing_indices] 
+            #return out
+            temp = vec.clone().reshape(vec.shape[0], self.channels, 256, 256).to(torch.complex64)
+
+            #temp = self._Vt @ temp
+            temp = torch.fft.fft2(temp, dim=(2, 3), norm='ortho')
+
+            temp[:, :, :128, :128] = torch.fft.ifftshift(temp[:, :, :128, :128], dim=(2, 3))
+            temp[:, :, 128:, :128] = torch.fft.ifftshift(temp[:, :, 128:, :128], dim=(2, 3))
+            temp[:, :, :128, 128:] = torch.fft.ifftshift(temp[:, :, :128, 128:], dim=(2, 3))
+            temp[:, :, 128:, 128:] = torch.fft.ifftshift(temp[:, :, 128:, 128:], dim=(2, 3))
+            temp = temp.reshape(vec.shape[0], self.channels, -1).permute(0, 2, 1).reshape(vec.shape[0], -1).real
+            
+            out = torch.zeros_like(temp)
+            out[:, :self.kept_indices.shape[0]] = temp[:, self.kept_indices]
+            out[:, self.kept_indices.shape[0]:] = temp[:, self.missing_indices]
+            #out = self._Vt @ out.reshape(vec.shape[0], self.channels, 256, 256).to(torch.complex64)           
+
+            return out.reshape(vec.shape[0], -1)
+        
+        def U(self, vec):
+            #vec = self.add_zeros(vec)
+            #vec = vec.to(torch.complex64).view(vec.shape[0], 3, 256, 256)
+            #retval = self._U @ vec
+            #return retval.view(vec.shape[0], -1).real
+            return vec.clone().reshape(vec.shape[0], -1)
+        
+    
+        def Ut(self, vec):
+            #vec = self.add_zeros(vec)
+            #vec = vec.to(torch.complex64).view(vec.shape[0], 3, 256, 256)
+            #retval = self._Ut @ vec
+            #return retval.view(vec.shape[0], -1).real
+            return vec.clone().reshape(vec.shape[0], -1)
+        
+    
+        def singulars(self):
+            return self._singulars
+    
+        def add_zeros(self, vec):
+            temp = torch.zeros((vec.shape[0], self.channels * self.img_dim**2), device=vec.device)
+            reshaped = vec.clone().reshape(vec.shape[0], -1)
+            temp[:, :reshaped.shape[1]] = reshaped
+            return temp
+
+
+class Fourier2D(H_functions):
+
+    def __init__(self, size, device):
+        self.size = size
+        dft_mat = DFT_matrix_2d(size, device)
+
+        #self._U, _, self._V = torch.svd(dft_mat, some=False)
+
+
+        self._V = dft_mat
+        self._U = torch.eye(size, device=device).to(torch.complex64)
+        self._Vt = self._V.transpose(0, 1)
+        self._Ut = self._U.transpose(0, 1)
+        self._singulars = torch.ones(3*size**2, device=device)
+
+ 
+
+    def V(self, vec):
+
+        vec = vec.to(torch.complex64).view(vec.shape[0], 3, 256, 256)
+        retval = self._V @ vec
+        return retval.view(vec.shape[0], -1).real
+    
+    def Vt(self, vec):
+        vec = vec.to(torch.complex64).view(vec.shape[0], 3, 256, 256)
+        retval = self._Vt @ vec
+        return retval.view(vec.shape[0], -1).real
+    
+    
+    def U(self, vec):
+        vec = vec.to(torch.complex64).view(vec.shape[0], 3, 256, 256)
+        retval = self._U @ vec
+        return retval.view(vec.shape[0], -1).real
+    
+
+    def Ut(self, vec):
+        vec = vec.to(torch.complex64).view(vec.shape[0], 3, 256, 256)
+        retval = self._Ut @ vec
+        return retval.view(vec.shape[0], -1).real
+    
+
+    def singulars(self):
+        return self._singulars
+
+    def add_zeros(self, vec):
+        return vec.clone().reshape(vec.shape[0], -1)
+    
+    
 
 #a memory inefficient implementation for any general degradation H
 class GeneralH(H_functions):
@@ -90,16 +263,16 @@ class GeneralH(H_functions):
         print(len([x.item() for x in self._singulars if x == 0]))
 
     def V(self, vec):
-        return self.mat_by_vec(self._V, vec.clone())
+        return self.mat_by_vec(self._V, vec)
 
     def Vt(self, vec):
-        return self.mat_by_vec(self._Vt, vec.clone())
+        return self.mat_by_vec(self._Vt, vec)
 
     def U(self, vec):
-        return self.mat_by_vec(self._U, vec.clone())
+        return self.mat_by_vec(self._U, vec)
 
     def Ut(self, vec):
-        return self.mat_by_vec(self._Ut, vec.clone())
+        return self.mat_by_vec(self._Ut, vec)
 
     def singulars(self):
         return self._singulars
@@ -545,82 +718,4 @@ class Deblurring2D(H_functions):
         return vec.clone().reshape(vec.shape[0], -1)
 
 
-def DFT_matrix_2d(N, device=torch.device('cpu')):
-    w = np.exp(-2*np.pi*1J/N)
-    i, j = np.meshgrid(np.arange(N), np.arange(N))
-    i[0,:] = 0
-    j[:,0] = 0
-    retval = w**(i*j) / np.sqrt(N)
-    return torch.tensor(retval, device=device)
-    #return the matrix as a complex number separated
-    #return torch.tensor(retval.real, device=device), torch.tensor(retval.imag, device=device)
-
-class Fourier2D(H_functions):
-    
-    def __init__(self, size, device):
-        self.size = size
-        self._singulars = torch.ones(size, device=device)
-
-        self.dft_mat = DFT_matrix_2d(size, device=device)
-        self.dft_mat_inv = torch.inverse(self.dft_mat)
-    
-    def V(self, vec):
-        print('V A')
-        print(vec.shape)
-        print(self.dft_mat.shape)
-        print('V B')
-        return torch.mv(self.dft_mat, vec)
-    
-    def Vt(self, vec):
-        print('Vt A')
-        print(vec.shape)
-        print(self.dft_mat.shape)
-        print('Vt B')
-        return torch.mv(self.dft_mat, vec)
-
-
-    def U(self, vec):
-        return torch.mv(self.dft_mat_inv, vec)
-
-    def Ut(self, vec):
-        return torch.mv(self.dft_mat_inv, vec)
-
-    def singulars(self):
-        return self._singulars
-
-    def add_zeros(self, vec):
-        return vec.clone().reshape(vec.shape[0], -1)
-    
-    
         
-
-class Fourier2DPermute(H_functions):
-
-    def __init__(self, size, permutation_matrix):
-
-        self.size = size
-        self._singulars = torch.ones(size)
-        self.permutation_matrix = permutation_matrix
-        self.inverse_permutation_matrix = torch.inverse(permutation_matrix)
-
-    def V(self, vec):
-        permuted_vec = torch.matmul(self.permutation_matrix, vec)
-        return torch.fft.fft(permuted_vec, dim=-1)
-    
-    def Vt(self, vec):
-        transformed_vec = torch.fft.ifft(vec, dim=-1)
-        return torch.matmul(self.inverse_permutation_matrix, transformed_vec)
-
-    def U(self, vec):
-        permuted_vec = torch.matmul(self.permutation_matrix, vec)
-        return torch.fft.fft(permuted_vec, dim=-1)
-    
-    def Ut(self, vec):
-        transformed_vec = torch.fft.ifft(vec, dim=-1)
-        return torch.matmul(self.inverse_permutation_matrix, transformed_vec)
-    
-    def singulars(self):
-        return self._singulars
-
-
-    
